@@ -948,7 +948,7 @@ function RoutesTab({user}) {
           <div style={{background:"#0a1228",border:"1px solid #12B6CF33",borderRadius:8,padding:"12px 14px",marginBottom:14}}>
             <div style={{fontSize:"0.57rem",color:"#12B6CF",letterSpacing:"0.1em",textTransform:"uppercase",marginBottom:6}}>Known residential streets ({selTown.name})</div>
             <div style={{display:"flex",flexWrap:"wrap",gap:5}}>{selTown.knownStreets.map(s=><span key={s} style={{background:"#162838",color:"#c0d8e4",fontSize:"0.6rem",padding:"3px 7px",borderRadius:4}}>{s}</span>)}</div>
-            <div style={{fontSize:"0.55rem",color:"#4a7a8a",marginTop:6}}>Verified street names — use the Zones tab to draw delivery rounds across these.</div>
+            <div style={{fontSize:"0.55rem",color:"#4a7a8a",marginTop:6}}>Notable residential streets in {selTown.name}. The Zone Builder also shows every other in-seat street from OpenStreetMap so you can draw rounds across the area in full.</div>
           </div>
         )}
         {townZones.length > 0 && (
@@ -1107,16 +1107,34 @@ function ZoneBuilderTab({user}) {
         const streetMap = {};
         (data.elements || []).forEach(el => {
           if (!el.tags?.name || !el.geometry || el.geometry.length < 2) return;
-          // Stage 3: discard any way where no node falls inside the official
-          // Aberdeen South constituency boundary, regardless of which area
-          // bounding box was used for the Overpass query.
-          const hasNodeInside = el.geometry.some(n => isInsideConstituency(n.lon, n.lat));
-          if (!hasNodeInside) return;
           const name = el.tags.name;
           if (!streetMap[name]) streetMap[name] = { name, id: name, segments: [] };
           streetMap[name].segments.push(el.geometry.map(n => [n.lat, n.lon]));
         });
-        setStreets(Object.values(streetMap));
+        // ── Polygon filter: keep only streets where the MAJORITY of points lie
+        // inside the official Aberdeen South constituency boundary. Drops streets
+        // that the Overpass bounding-box picked up but which are actually in a
+        // neighbouring constituency (Aberdeen North, West Aberdeenshire, etc).
+        const allStreets = Object.values(streetMap);
+        const inSeat = [];
+        let droppedCount = 0;
+        allStreets.forEach(street => {
+          let total = 0, inside = 0;
+          street.segments.forEach(seg => {
+            seg.forEach(pt => {
+              // pt is [lat, lng]; isInsideConstituency takes (lng, lat)
+              total++;
+              if (isInsideConstituency(pt[1], pt[0])) inside++;
+            });
+          });
+          if (total > 0 && inside * 2 > total) {
+            inSeat.push(street);
+          } else {
+            droppedCount++;
+          }
+        });
+        console.log(`[Zone Builder] ${town.name}: loaded ${allStreets.length} streets, kept ${inSeat.length} inside Aberdeen South, dropped ${droppedCount} outside.`);
+        setStreets(inSeat);
       }
     } catch(e) { console.error("Overpass error:", e); }
     setLoading(false);
@@ -1143,7 +1161,12 @@ function ZoneBuilderTab({user}) {
                 if (!bySector[sectorKey]) bySector[sectorKey] = pc;
               });
               Object.entries(bySector).forEach(([sectorKey, pc]) => {
-                if (seen.has(sectorKey)) return; seen.add(sectorKey);
+                if (seen.has(sectorKey)) return;
+                // Drop postcode dots that fall outside the Aberdeen South boundary.
+                // postcodes.io returns the postcode's central point as lat/lng, so a
+                // simple point-in-polygon check is exactly right here.
+                if (!isInsideConstituency(pc.longitude, pc.latitude)) return;
+                seen.add(sectorKey);
                 dots.push({ postcode: sectorKey, lat: pc.latitude, lng: pc.longitude, townId: t.id, townColor: t.color, townName: t.name });
               });
             }
@@ -1162,21 +1185,22 @@ function ZoneBuilderTab({user}) {
   function toggleStreet(streetId) { setSelectedStreets(prev => { const next = new Set(prev); if (next.has(streetId)) next.delete(streetId); else next.add(streetId); return next; }); }
   function toggleDot(postcode) { setSelected(prev => { const next = new Set(prev); if (next.has(postcode)) next.delete(postcode); else next.add(postcode); return next; }); }
 
-  // Street colour update — with the debugged 500ms delayed re-run (skip-mode fix)
+  // Street colour update — with the debugged 500ms delayed re-run (skip-mode fix).
+  // After Stage 3 the constituency polygon filters which streets get shown at all,
+  // so the verified/unverified two-tier colouring is no longer needed — every street
+  // on the map is in-seat. One colour for "available", plus selected/saved/skipped states.
   useEffect(() => {
     if (!selTown) return;
     const run = () => {
       const savedStreetNames = new Set(zones.filter(z => z.townId === selTown.id).flatMap(z => (z.streets || []).map(s => s.name)));
       const skippedStreetNames = new Set(skippedAreas.filter(s => s.townId === selTown.id).flatMap(s => (s.streets || []).map(st => st.name)));
-      const knownStreetNameSet = new Set((selTown.knownStreets || []).map(s => s.toLowerCase()));
       Object.entries(streetLayersRef.current).forEach(([id, layers]) => {
         const isSelected = selectedStreets.has(id);
         const isSaved = savedStreetNames.has(id);
         const isSkipped = skippedStreetNames.has(id);
-        const isVerified = knownStreetNameSet.has(id.toLowerCase());
-        const color = isSelected && modeRef.current === "skip" ? "#FF006E" : isSelected ? "#FF8C00" : isSkipped ? "#FF006E" : isSaved ? "#00C853" : isVerified ? "#12B6CF" : "#5a8294";
-        const weight = isSelected ? 7 : isSkipped ? 6 : isSaved ? 5 : isVerified ? 4 : 2;
-        const opacity = isSelected ? 1 : isSkipped ? 1 : isSaved ? 0.9 : isVerified ? 0.95 : 0.55;
+        const color = isSelected && modeRef.current === "skip" ? "#FF006E" : isSelected ? "#FF8C00" : isSkipped ? "#FF006E" : isSaved ? "#00C853" : "#12B6CF";
+        const weight = isSelected ? 7 : isSkipped ? 6 : isSaved ? 5 : 3;
+        const opacity = isSelected ? 1 : isSkipped ? 1 : isSaved ? 0.9 : 0.85;
         layers.forEach(l => l.setStyle({ color, weight, opacity }));
       });
     };
@@ -1225,32 +1249,35 @@ function ZoneBuilderTab({user}) {
       const bounds = [];
       const savedStreetNameSet = new Set(zones.filter(z => z.townId === (selTown?.id || "")).flatMap(z => (z.streets||[]).map(s => s.name)));
       const skippedStreetNameSet = new Set(skippedAreas.filter(s => s.townId === (selTown?.id || "")).flatMap(s => (s.streets||[]).map(st => st.name)));
-      // Verified-street set for this area (case-insensitive comparison).
-      const knownStreetNameSet = new Set((selTown?.knownStreets || []).map(s => s.toLowerCase()));
+      // After Stage 3 every street on the map is inside the constituency boundary,
+      // so the verified/unverified two-tier styling has been retired — one cyan colour
+      // for all "available" streets, plus selected/saved/skipped overlay states.
       streets.forEach(street => {
         const layers = [];
         const isSaved = savedStreetNameSet.has(street.name);
         const isSkipped = skippedStreetNameSet.has(street.name);
-        const isVerified = knownStreetNameSet.has(street.name.toLowerCase());
-        const initColor = isSkipped ? "#FF006E" : isSaved ? "#00C853" : isVerified ? "#12B6CF" : "#5a8294";
-        const initWeight = isSkipped ? 6 : isSaved ? 5 : isVerified ? 4 : 2;
-        const initOpacity = isSkipped ? 1 : isSaved ? 0.9 : isVerified ? 0.95 : 0.55;
+        const initColor = isSkipped ? "#FF006E" : isSaved ? "#00C853" : "#12B6CF";
+        const initWeight = isSkipped ? 6 : isSaved ? 5 : 3;
+        const initOpacity = isSkipped ? 1 : isSaved ? 0.9 : 0.85;
         street.segments.forEach(seg => {
           if (seg.length < 2) return;
           const line = L.polyline(seg, { color: initColor, weight: initWeight, opacity: initOpacity }).addTo(map);
-          line.bindTooltip(`${street.name}${isSaved ? " ✓ Zoned" : isSkipped ? " ❌ Skipped" : isVerified ? " ★ Verified" : ""}`, { sticky: true, direction: "top", className: "" });
+          line.bindTooltip(`${street.name}${isSaved ? " ✓ Zoned" : isSkipped ? " ❌ Skipped" : ""}`, { sticky: true, direction: "top", className: "" });
           line.on("click", () => { toggleStreet(street.id); });
           layers.push(line); seg.forEach(pt => bounds.push(pt));
         });
         streetLayersRef.current[street.id] = layers;
       });
-      // Draw the search-box boundary as a thin dashed rectangle so the user can
-      // see exactly where this area's search extends (and whether it overlaps neighbours).
+      // Optional area-of-focus hint: a thin dashed rectangle showing the Overpass
+      // search box for the selected area. With Stage-3 polygon filtering the
+      // accuracy no longer depends on this box — it's purely a visual cue for where
+      // the manager's attention is right now. Kept subtle so it doesn't compete
+      // with the pink constituency boundary.
       if (selTown && selTown.id !== "constituency" && selTown.searchPadNS != null) {
         const padNS = selTown.searchPadNS, padEW = selTown.searchPadEW ?? 0.020;
         const sw = [selTown.lat - padNS, selTown.lng - padEW];
         const ne = [selTown.lat + padNS, selTown.lng + padEW];
-        L.rectangle([sw, ne], { color: selTown.color || "#FFB347", weight: 1, opacity: 0.7, fillOpacity: 0, dashArray: "5,5", interactive: false }).addTo(map);
+        L.rectangle([sw, ne], { color: selTown.color || "#FFB347", weight: 1, opacity: 0.4, fillOpacity: 0, dashArray: "4,6", interactive: false }).addTo(map);
       }
       const zonedPcSet = new Set(zones.flatMap(z => (z.postcodes||[]).map(p => p.postcode)));
       const skippedPcSet = new Set(skippedAreas.flatMap(s => (s.postcodes||[]).map(p => p.postcode)));
@@ -1391,8 +1418,7 @@ function ZoneBuilderTab({user}) {
           </div>
           <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:8,flexWrap:"wrap"}}>
             <div style={{display:"flex",alignItems:"center",gap:4}}><div style={{width:20,height:3,background:"#E91E63",borderRadius:2}}/><span style={{fontSize:"0.58rem",color:"#90E0EF"}}>Seat boundary</span></div>
-            <div style={{display:"flex",alignItems:"center",gap:4}}><div style={{width:20,height:3,background:"#12B6CF",borderRadius:2}}/><span style={{fontSize:"0.58rem",color:"#90E0EF"}}>Verified ★</span></div>
-            <div style={{display:"flex",alignItems:"center",gap:4}}><div style={{width:20,height:2,background:"#5a8294",borderRadius:2}}/><span style={{fontSize:"0.58rem",color:"#90E0EF"}}>Other</span></div>
+            <div style={{display:"flex",alignItems:"center",gap:4}}><div style={{width:20,height:3,background:"#12B6CF",borderRadius:2}}/><span style={{fontSize:"0.58rem",color:"#90E0EF"}}>Street</span></div>
             <div style={{display:"flex",alignItems:"center",gap:4}}><div style={{width:20,height:3,background:"#FF8C00",borderRadius:2}}/><span style={{fontSize:"0.58rem",color:"#90E0EF"}}>Selected</span></div>
             <div style={{display:"flex",alignItems:"center",gap:4}}><div style={{width:20,height:3,background:"#00C853",borderRadius:2}}/><span style={{fontSize:"0.58rem",color:"#90E0EF"}}>Zoned</span></div>
             <div style={{display:"flex",alignItems:"center",gap:4}}><div style={{width:20,height:3,background:"#FF006E",borderRadius:2}}/><span style={{fontSize:"0.58rem",color:"#90E0EF"}}>Skipped</span></div>
