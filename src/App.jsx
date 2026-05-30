@@ -1107,6 +1107,11 @@ function ZoneBuilderTab({user}) {
         const streetMap = {};
         (data.elements || []).forEach(el => {
           if (!el.tags?.name || !el.geometry || el.geometry.length < 2) return;
+          // Stage 3: discard any way where no node falls inside the official
+          // Aberdeen South constituency boundary, regardless of which area
+          // bounding box was used for the Overpass query.
+          const hasNodeInside = el.geometry.some(n => isInsideConstituency(n.lon, n.lat));
+          if (!hasNodeInside) return;
           const name = el.tags.name;
           if (!streetMap[name]) streetMap[name] = { name, id: name, segments: [] };
           streetMap[name].segments.push(el.geometry.map(n => [n.lat, n.lon]));
