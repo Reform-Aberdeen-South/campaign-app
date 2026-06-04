@@ -1164,13 +1164,27 @@ function ZoneBuilderTab({user}) {
   // Each area has a hard-coded polygon in TOWNS. Users with edit
   // permission can override an area's polygon via the in-app polygon
   // editor; overrides are stored in Firestore collection "polygonOverrides"
-  // (one doc per townId, doc data { polygon: [[lng,lat],...], editedBy, editedAt }).
-  // The effective polygon for a town is: override if present, else hard-coded.
+  // (one doc per townId).
+  //
+  // FIRESTORE QUIRK: Firestore documents cannot contain nested arrays (an
+  // array of arrays is rejected). So we store each polygon vertex as an
+  // object { lng, lat } instead of a 2-tuple [lng, lat]. When reading, we
+  // convert back to the [lng, lat] array format used everywhere else.
   const [polygonOverrides, setPolygonOverrides] = useState({});
   useEffect(() => {
     const unsub = onSnapshot(collection(db, "polygonOverrides"), snap => {
       const map = {};
-      snap.forEach(d => { map[d.id] = d.data(); });
+      snap.forEach(d => {
+        const raw = d.data();
+        // Convert stored vertex objects back to [lng, lat] arrays.
+        if (Array.isArray(raw.vertices)) {
+          const ring = raw.vertices.map(v => [v.lng, v.lat]);
+          map[d.id] = { ...raw, polygon: ring };
+        } else if (Array.isArray(raw.polygon)) {
+          // Backward-compat: some older docs might still have polygon as array.
+          map[d.id] = raw;
+        }
+      });
       setPolygonOverrides(map);
     });
     return () => unsub();
@@ -1555,8 +1569,12 @@ function ZoneBuilderTab({user}) {
     const ok = window.confirm(`Save ${selTown.name} polygon (${vertexCount} vertices)?\n\nThis goes live immediately for everyone.`);
     if (!ok) return;
     try {
+      // Firestore can't store nested arrays, so convert each vertex from
+      // a 2-tuple [lng, lat] into an object { lng, lat }. The read-side
+      // converts back to arrays on the way in.
+      const vertices = ring.map(v => ({ lng: v[0], lat: v[1] }));
       await setDoc(doc(db, "polygonOverrides", selTown.id), {
-        polygon: ring,
+        vertices,
         townId: selTown.id,
         townName: selTown.name,
         editedBy: user?.name || "Unknown",
