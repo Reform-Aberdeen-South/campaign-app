@@ -1436,26 +1436,48 @@ function ZoneBuilderTab({user}) {
       if (selTown && selTown.id !== "constituency") {
         const effPoly = getEffectivePolygon(selTown);
         if (effPoly) {
-          const ring = effPoly.map(p => [p[1], p[0]]); // [lng,lat] -> [lat,lng]
+          // Convert [lng,lat] to [lat,lng] AND strip the closing duplicate vertex,
+          // which Leaflet adds back automatically when drawing a polygon. Passing the
+          // closed ring causes Geoman to treat the duplicate as a real editable vertex,
+          // which then breaks vertex handles.
+          const openRing = effPoly.slice();
+          if (openRing.length > 1) {
+            const first = openRing[0], last = openRing[openRing.length - 1];
+            if (first[0] === last[0] && first[1] === last[1]) openRing.pop();
+          }
+          const ringLatLng = openRing.map(p => [p[1], p[0]]); // [lng,lat] -> [lat,lng]
           if (editMode) {
-            // Editable polygon — uses Leaflet-Geoman if available.
-            const poly = L.polygon(ring, { color: selTown.color || "#FFB347", weight: 3, opacity: 0.9, fillOpacity: 0.05 }).addTo(map);
-            if (typeof poly.pm !== "undefined" && poly.pm.enable) {
+            // Editable polygon — uses Leaflet-Geoman.
+            const poly = L.polygon(ringLatLng, {
+              color: selTown.color || "#FFB347",
+              weight: 3, opacity: 0.9,
+              fillColor: selTown.color || "#FFB347", fillOpacity: 0.08,
+            }).addTo(map);
+            editLayerRef.current = poly;
+            console.log(`[Polygon editor] Activating editor for ${selTown.name} (${ringLatLng.length} vertices). L.PM available:`, typeof L.PM !== "undefined", "poly.pm available:", typeof poly.pm !== "undefined");
+            // Defer Geoman enable by one tick so the layer is fully registered.
+            const enableTimer = setTimeout(() => {
               try {
+                if (typeof poly.pm === "undefined") {
+                  console.warn("[Polygon editor] Geoman not available on polygon layer — handles cannot show. Check that Leaflet-Geoman is loaded in index.html.");
+                  return;
+                }
                 poly.pm.enable({
                   allowSelfIntersection: false,
                   preventMarkerRemoval: false,
-                  snappable: true,
+                  snappable: false,
                   draggable: false,
+                  removeLayerBelowMinVertexCount: false,
                 });
-              } catch(e) { console.warn("Geoman enable failed:", e); }
-            }
-            editLayerRef.current = poly;
+                console.log("[Polygon editor] Editor enabled. You should see vertex handles now.");
+              } catch(e) { console.error("[Polygon editor] Geoman enable failed:", e); }
+            }, 50);
             // Live-update the stored shape as the user drags vertices.
             const captureShape = () => {
               const latlngs = poly.getLatLngs()[0]; // [{lat,lng},...]
+              if (!latlngs) return;
               const ringOut = latlngs.map(ll => [ll.lng, ll.lat]);
-              // Close the ring if not closed
+              // Close the ring (first == last)
               if (ringOut.length > 0) {
                 const first = ringOut[0], last = ringOut[ringOut.length-1];
                 if (first[0] !== last[0] || first[1] !== last[1]) ringOut.push([first[0], first[1]]);
@@ -1463,10 +1485,11 @@ function ZoneBuilderTab({user}) {
               editedPolygonRef.current = ringOut;
             };
             poly.on("pm:markerdragend pm:vertexadded pm:vertexremoved pm:edit pm:update", captureShape);
-            captureShape();  // initial capture
+            captureShape();  // initial capture so save works even without edits
           } else {
-            // Static polygon — read-only view.
-            L.polyline(ring, { color: selTown.color || "#FFB347", weight: 2, opacity: 0.7, dashArray: "6,4", interactive: false }).addTo(map);
+            // Static polygon — read-only view, closed ring works fine here.
+            const closedRing = effPoly.map(p => [p[1], p[0]]);
+            L.polyline(closedRing, { color: selTown.color || "#FFB347", weight: 2, opacity: 0.7, dashArray: "6,4", interactive: false }).addTo(map);
           }
         } else if (selTown.searchPadNS != null) {
           const padNS = selTown.searchPadNS, padEW = selTown.searchPadEW ?? 0.020;
