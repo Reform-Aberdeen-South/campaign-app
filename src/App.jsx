@@ -1523,7 +1523,9 @@ function ZoneBuilderTab({user}) {
             if (first[0] === last[0] && first[1] === last[1]) openRing.pop();
           }
           const ringLatLng = openRing.map(p => [p[1], p[0]]); // [lng,lat] -> [lat,lng]
-          // Also draw neighbouring polygons faintly so the user can see borders.
+          // Also draw neighbouring polygons clearly so the user can see borders,
+          // align edges, and spot gaps/overlaps. Include their vertex points in
+          // the map bounds so the auto-fit doesn't crop them off-screen.
           if (editMode) {
             visibleTowns().forEach(other => {
               if (other.id === selTown.id) return;
@@ -1532,8 +1534,21 @@ function ZoneBuilderTab({user}) {
               const otherRing = otherPoly.map(p => [p[1], p[0]]);
               L.polyline(otherRing, {
                 color: other.color || "#FFB347",
-                weight: 1, opacity: 0.35, dashArray: "4,4", interactive: false,
+                weight: 2, opacity: 0.7, dashArray: "6,3", interactive: false,
               }).addTo(map);
+              // Compute centroid for a name label
+              const lats = otherRing.map(p => p[0]);
+              const lngs = otherRing.map(p => p[1]);
+              const cLat = (Math.min(...lats) + Math.max(...lats)) / 2;
+              const cLng = (Math.min(...lngs) + Math.max(...lngs)) / 2;
+              const labelIcon = L.divIcon({
+                html: `<div style="background:${other.color}cc;color:#fff;padding:2px 6px;border-radius:4px;font-size:0.55rem;font-weight:700;white-space:nowrap;box-shadow:0 1px 3px rgba(0,0,0,0.4)">${other.name}</div>`,
+                iconSize: null, className: "",
+              });
+              L.marker([cLat, cLng], { icon: labelIcon, interactive: false }).addTo(map);
+              // Add a sparse sample of the ring to bounds so the map zoom includes them.
+              // Sample every 3rd point to keep the bounds-fit reasonable.
+              for (let i = 0; i < otherRing.length; i += 3) bounds.push(otherRing[i]);
             });
           }
           if (editMode) {
