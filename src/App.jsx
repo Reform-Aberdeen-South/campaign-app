@@ -1171,19 +1171,26 @@ function ZoneBuilderTab({user}) {
   // object { lng, lat } instead of a 2-tuple [lng, lat]. When reading, we
   // convert back to the [lng, lat] array format used everywhere else.
   const [polygonOverrides, setPolygonOverrides] = useState({});
+  // Whether to show areas that have been soft-deleted (hidden=true).
+  // Off by default; toggled on via "Show hidden" button in the area list.
+  const [showHidden, setShowHidden] = useState(false);
   useEffect(() => {
     const unsub = onSnapshot(collection(db, "polygonOverrides"), snap => {
       const map = {};
       snap.forEach(d => {
         const raw = d.data();
-        // Convert stored vertex objects back to [lng, lat] arrays.
+        // A polygon override doc may have:
+        //   - vertices: a list of {lng,lat} objects (a polygon edit)
+        //   - hidden: true (soft-delete marker)
+        //   - both (an edited area that was later hidden)
+        const entry = { ...raw };
         if (Array.isArray(raw.vertices)) {
-          const ring = raw.vertices.map(v => [v.lng, v.lat]);
-          map[d.id] = { ...raw, polygon: ring };
+          entry.polygon = raw.vertices.map(v => [v.lng, v.lat]);
         } else if (Array.isArray(raw.polygon)) {
-          // Backward-compat: some older docs might still have polygon as array.
-          map[d.id] = raw;
+          // Backward-compat for any docs created before the array→object fix.
+          entry.polygon = raw.polygon;
         }
+        map[d.id] = entry;
       });
       setPolygonOverrides(map);
     });
@@ -1195,6 +1202,16 @@ function ZoneBuilderTab({user}) {
     const ov = polygonOverrides[town.id];
     if (ov && Array.isArray(ov.polygon) && ov.polygon.length >= 3) return ov.polygon;
     return town.polygon || null;
+  }
+  // True if this town has been soft-deleted (hidden flag set in Firestore).
+  function isAreaHidden(town) {
+    if (!town) return false;
+    return !!polygonOverrides[town.id]?.hidden;
+  }
+  // The TOWNS list filtered to remove hidden areas (unless showHidden is on).
+  function visibleTowns() {
+    if (showHidden) return TOWNS;
+    return TOWNS.filter(t => !isAreaHidden(t));
   }
 
   // ── Polygon editor state ────────────────────────────────────────
@@ -1323,7 +1340,7 @@ function ZoneBuilderTab({user}) {
     setLoading(true); setAllDots([]); setSelected(new Set());
     const dots = []; const seen = new Set();
     try {
-      const townsToLoad = town.id === "constituency" ? TOWNS : [town];
+      const townsToLoad = town.id === "constituency" ? visibleTowns() : [town];
       for (const t of townsToLoad) {
         const hasLetters = t.subsectorLetters && t.subsectorLetters.length > 0;
         const sectorQueries = hasLetters ? t.subsectorLetters.map(l => `${t.subsectorPrefix}${l}`) : t.customSubsectors ? t.customSubsectors.map(cs => cs.code) : t.sectors || [];
@@ -1464,7 +1481,36 @@ function ZoneBuilderTab({user}) {
       // Draw the area boundary on the map. When edit mode is ON for the selected
       // area, draw it as an EDITABLE Leaflet-Geoman polygon so the manager can
       // drag vertices. Otherwise draw it as a non-interactive coloured polyline.
-      if (selTown && selTown.id !== "constituency") {
+      //
+      // SPECIAL CASE — whole-constituency view: draw every visible area polygon
+      // at once so the manager can see all boundaries together. In edit mode,
+      // each polygon is clickable: click switches focus to that area.
+      if (selTown && selTown.id === "constituency") {
+        visibleTowns().forEach(t => {
+          const eff = getEffectivePolygon(t);
+          if (!eff) return;
+          const closedRing = eff.map(p => [p[1], p[0]]);
+          const fillOpacity = editMode ? 0.15 : 0.08;
+          const layer = L.polygon(closedRing, {
+            color: t.color || "#FFB347",
+            weight: 2,
+            opacity: 0.85,
+            fillColor: t.color || "#FFB347",
+            fillOpacity,
+            interactive: editMode,  // only clickable in edit mode
+          }).addTo(map);
+          if (editMode) {
+            // Clicking a polygon switches focus to that area for individual editing.
+            layer.bindTooltip(`Click to edit ${t.name}`, { sticky: true, direction: "top" });
+            layer.on("click", () => {
+              openTownMap(t);
+              // editMode stays true so we go straight into the area's editor.
+            });
+            // Cursor hint
+            layer.on("mouseover", () => { try { layer._path.style.cursor = "pointer"; } catch(e){} });
+          }
+        });
+      } else if (selTown && selTown.id !== "constituency") {
         const effPoly = getEffectivePolygon(selTown);
         if (effPoly) {
           // Convert [lng,lat] to [lat,lng] AND strip the closing duplicate vertex,
@@ -1477,6 +1523,19 @@ function ZoneBuilderTab({user}) {
             if (first[0] === last[0] && first[1] === last[1]) openRing.pop();
           }
           const ringLatLng = openRing.map(p => [p[1], p[0]]); // [lng,lat] -> [lat,lng]
+          // Also draw neighbouring polygons faintly so the user can see borders.
+          if (editMode) {
+            visibleTowns().forEach(other => {
+              if (other.id === selTown.id) return;
+              const otherPoly = getEffectivePolygon(other);
+              if (!otherPoly) return;
+              const otherRing = otherPoly.map(p => [p[1], p[0]]);
+              L.polyline(otherRing, {
+                color: other.color || "#FFB347",
+                weight: 1, opacity: 0.35, dashArray: "4,4", interactive: false,
+              }).addTo(map);
+            });
+          }
           if (editMode) {
             // Editable polygon — uses Leaflet-Geoman.
             const poly = L.polygon(ringLatLng, {
@@ -1625,19 +1684,84 @@ function ZoneBuilderTab({user}) {
       setTimeout(() => setEditStatus(""), 6000);
     }
   }
+  // Soft-delete an area: set hidden:true in its override doc. The area
+  // disappears from the area list, the Zone Builder, the Areas tab — but
+  // any zones already saved that reference its townId remain intact.
+  async function deleteArea() {
+    if (!selTown || selTown.id === "constituency") return;
+    const ok = window.confirm(`Delete "${selTown.name}" from the area list?\n\nThis is a soft-delete — the area will be hidden everywhere in the app, but any zones already saved under it remain intact. You can restore it later from the area list (toggle "Show hidden").\n\nGoes live immediately for everyone.`);
+    if (!ok) return;
+    try {
+      const existing = polygonOverrides[selTown.id] || {};
+      // Preserve any existing vertices so a restore brings back the edited polygon.
+      const payload = {
+        ...existing,
+        hidden: true,
+        townId: selTown.id,
+        townName: selTown.name,
+        editedBy: user?.name || "Unknown",
+        editedAt: serverTimestamp(),
+      };
+      // serverTimestamp() field marker — Firestore handles it.
+      await setDoc(doc(db, "polygonOverrides", selTown.id), payload);
+      setEditStatus(`Deleted ${selTown.name}.`);
+      setEditMode(false);
+      setSelTown(null);
+      setView("towns");
+      setTimeout(() => setEditStatus(""), 4000);
+    } catch(e) {
+      console.error("Delete area failed:", e);
+      setEditStatus(`Delete failed: ${e.message}`);
+      setTimeout(() => setEditStatus(""), 6000);
+    }
+  }
+  // Restore a soft-deleted area — clear the hidden flag.
+  async function restoreArea(townId) {
+    const town = TOWNS.find(t => t.id === townId);
+    if (!town) return;
+    const ok = window.confirm(`Restore "${town.name}" to the area list?`);
+    if (!ok) return;
+    try {
+      const existing = polygonOverrides[townId] || {};
+      // If there's only the hidden flag and nothing else, delete the doc entirely.
+      // Otherwise just clear hidden but keep any polygon edit.
+      if (!Array.isArray(existing.vertices) && !Array.isArray(existing.polygon)) {
+        await deleteDoc(doc(db, "polygonOverrides", townId));
+      } else {
+        const { hidden, ...rest } = existing;
+        await setDoc(doc(db, "polygonOverrides", townId), {
+          ...rest,
+          editedBy: user?.name || "Unknown",
+          editedAt: serverTimestamp(),
+        });
+      }
+      setEditStatus(`Restored ${town.name}.`);
+      setTimeout(() => setEditStatus(""), 4000);
+    } catch(e) {
+      console.error("Restore area failed:", e);
+      setEditStatus(`Restore failed: ${e.message}`);
+      setTimeout(() => setEditStatus(""), 6000);
+    }
+  }
   // Build a code-ready export of every effective polygon (hard-coded + overrides),
   // so the manager can paste the result into the next App.jsx release.
   function buildPolygonExport() {
     const lines = [];
     lines.push("// Polygon export — generated " + new Date().toISOString());
     lines.push("// Paste the relevant polygon: lines into the matching TOWNS entries.");
+    lines.push("// Lines marked HIDDEN are soft-deleted in Firebase — for permanent code, remove them.");
     lines.push("");
     TOWNS.forEach(t => {
       if (t.id === "constituency") return;
       const eff = getEffectivePolygon(t);
       if (!eff) return;
-      const overridden = !!polygonOverrides[t.id];
-      lines.push(`// ${t.name} (${t.id})${overridden ? " — EDITED" : ""}`);
+      const ov = polygonOverrides[t.id];
+      const hasEdit = !!(ov && (Array.isArray(ov.vertices) || Array.isArray(ov.polygon)));
+      const isHidden = !!ov?.hidden;
+      const marks = [];
+      if (hasEdit) marks.push("EDITED");
+      if (isHidden) marks.push("HIDDEN");
+      lines.push(`// ${t.name} (${t.id})${marks.length ? " — " + marks.join(", ") : ""}`);
       lines.push(`polygon: ${JSON.stringify(eff)},`);
       lines.push("");
     });
@@ -1728,24 +1852,30 @@ function ZoneBuilderTab({user}) {
           <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:6,gap:8}}>
             <button onClick={()=>{setEditMode(false);setView("towns");if(mapInstanceRef.current){mapInstanceRef.current.remove();mapInstanceRef.current=null;}}} style={{background:"none",border:"none",color:"#12B6CF",fontSize:"0.75rem",cursor:"pointer",padding:0}}>← Areas</button>
             <div style={{display:"flex",gap:6,alignItems:"center"}}>
-              {isDesktop && selTown && selTown.id !== "constituency" && (
-                <button onClick={unlockEditor} title="Edit polygon (desktop only, passcode protected)" style={{background:editMode?"#FFB347":"#1a3a50",border:`1px solid ${editMode?"#FFB347":"#12B6CF55"}`,borderRadius:6,color:editMode?"#03045E":"#12B6CF",fontSize:"0.62rem",fontWeight:700,padding:"4px 10px",cursor:"pointer",whiteSpace:"nowrap"}}>{editMode?"✏️ Editing":"✏️ Edit Polygon"}</button>
+              {isDesktop && selTown && (
+                <button onClick={unlockEditor} title="Edit polygons (desktop only, passcode protected)" style={{background:editMode?"#FFB347":"#1a3a50",border:`1px solid ${editMode?"#FFB347":"#12B6CF55"}`,borderRadius:6,color:editMode?"#03045E":"#12B6CF",fontSize:"0.62rem",fontWeight:700,padding:"4px 10px",cursor:"pointer",whiteSpace:"nowrap"}}>{editMode?"✏️ Editing":"✏️ Edit Polygon"}</button>
               )}
               <button onClick={()=>setView("zones")} style={{background:"#1a3a50",border:"1px solid #12B6CF",borderRadius:6,color:"#12B6CF",fontSize:"0.62rem",padding:"4px 10px",cursor:"pointer"}}>{townZones.length} zones</button>
             </div>
           </div>
-          <div style={{fontSize:"0.82rem",fontWeight:700,color:"#fff"}}>{selTown.name} — {editMode ? "✏️ Edit polygon" : mode === "skip" ? "❌ Skip mode" : "🗺 Zone mode"}</div>
+          <div style={{fontSize:"0.82rem",fontWeight:700,color:"#fff"}}>{selTown.name} — {editMode ? (selTown.id === "constituency" ? "✏️ Edit polygons" : "✏️ Edit polygon") : mode === "skip" ? "❌ Skip mode" : "🗺 Zone mode"}</div>
           <div style={{fontSize:"0.58rem",color:"#90E0EF",marginTop:2}}>{loading ? "Loading…" : `${streets.length} streets · ${allDots.length} postcode pts · ${totalSelected} selected`}</div>
-          <div style={{fontSize:"0.55rem",color:"#4a7a8a",marginTop:2}}>{editMode ? "Drag vertices to reshape. Click a midpoint dot to add a vertex. Right-click a vertex to remove it." : "Tap streets or dots to select · Hold Shift + drag to select area"}</div>
+          <div style={{fontSize:"0.55rem",color:"#4a7a8a",marginTop:2}}>{editMode ? (selTown.id === "constituency" ? "Click any polygon to edit its vertices. Use this view to see all area boundaries together and spot overlaps or gaps." : "Drag vertices to reshape. Click a midpoint dot to add a vertex. Right-click a vertex to remove it.") : "Tap streets or dots to select · Hold Shift + drag to select area"}</div>
         </div>
         {editMode && (
           <div style={{background:"#1a1330",padding:"8px 16px",borderBottom:"1px solid #FFB347",display:"flex",alignItems:"center",gap:8,flexWrap:"wrap"}}>
-            <button onClick={savePolygonOverride} style={{background:"#4CAF50",border:"none",borderRadius:6,color:"#fff",fontSize:"0.65rem",fontWeight:700,padding:"6px 12px",cursor:"pointer"}}>💾 Save polygon</button>
-            <button onClick={revertPolygonOverride} disabled={!polygonOverrides[selTown?.id]} style={{background:polygonOverrides[selTown?.id]?"#FF8C00":"#1a3a50",border:"none",borderRadius:6,color:polygonOverrides[selTown?.id]?"#fff":"#4a7a8a",fontSize:"0.65rem",fontWeight:700,padding:"6px 12px",cursor:polygonOverrides[selTown?.id]?"pointer":"default"}}>↺ Revert to built-in</button>
+            {selTown?.id !== "constituency" && (<>
+              <button onClick={savePolygonOverride} style={{background:"#4CAF50",border:"none",borderRadius:6,color:"#fff",fontSize:"0.65rem",fontWeight:700,padding:"6px 12px",cursor:"pointer"}}>💾 Save polygon</button>
+              <button onClick={revertPolygonOverride} disabled={!polygonOverrides[selTown?.id]} style={{background:polygonOverrides[selTown?.id]?"#FF8C00":"#1a3a50",border:"none",borderRadius:6,color:polygonOverrides[selTown?.id]?"#fff":"#4a7a8a",fontSize:"0.65rem",fontWeight:700,padding:"6px 12px",cursor:polygonOverrides[selTown?.id]?"pointer":"default"}}>↺ Revert to built-in</button>
+              <button onClick={deleteArea} style={{background:"#D32F2F",border:"none",borderRadius:6,color:"#fff",fontSize:"0.65rem",fontWeight:700,padding:"6px 12px",cursor:"pointer"}}>🗑 Delete area</button>
+            </>)}
+            {selTown?.id === "constituency" && (
+              <div style={{fontSize:"0.62rem",color:"#FFB347",fontWeight:600}}>Click on any polygon to switch to that area's editor</div>
+            )}
             <button onClick={()=>setExportOpen(true)} style={{background:"#1a3a50",border:"1px solid #12B6CF",borderRadius:6,color:"#12B6CF",fontSize:"0.65rem",fontWeight:700,padding:"6px 12px",cursor:"pointer"}}>📋 Export all</button>
             <button onClick={()=>setEditMode(false)} style={{background:"none",border:"1px solid #4a7a8a",borderRadius:6,color:"#90E0EF",fontSize:"0.65rem",padding:"6px 12px",cursor:"pointer",marginLeft:"auto"}}>Done</button>
-            {editStatus && <div style={{flexBasis:"100%",fontSize:"0.6rem",color:editStatus.startsWith("Save failed")||editStatus.startsWith("Revert failed")?"#FF6B35":"#4CAF50",marginTop:4}}>{editStatus}</div>}
-            {polygonOverrides[selTown?.id] && <div style={{flexBasis:"100%",fontSize:"0.55rem",color:"#FFB347"}}>This area has an active override (edited by {polygonOverrides[selTown?.id].editedBy||"unknown"}).</div>}
+            {editStatus && <div style={{flexBasis:"100%",fontSize:"0.6rem",color:editStatus.startsWith("Save failed")||editStatus.startsWith("Revert failed")||editStatus.startsWith("Delete failed")||editStatus.startsWith("Restore failed")?"#FF6B35":"#4CAF50",marginTop:4}}>{editStatus}</div>}
+            {selTown?.id !== "constituency" && polygonOverrides[selTown?.id] && <div style={{flexBasis:"100%",fontSize:"0.55rem",color:"#FFB347"}}>This area has an active override (edited by {polygonOverrides[selTown?.id].editedBy||"unknown"}).</div>}
           </div>
         )}
         {loading ? <div style={{flex:1,display:"flex",alignItems:"center",justifyContent:"center",background:"#060d18"}}><div style={{color:"#12B6CF",fontSize:"0.8rem"}}>Loading map data…</div></div> : <div ref={mapRef} style={{flex:1,width:"100%"}}/>}
@@ -1803,27 +1933,41 @@ function ZoneBuilderTab({user}) {
         <div style={{fontSize:"0.7rem",color:"#c0d8e4",lineHeight:1.6}}>Select an area. Streets are drawn as lines — tap to select, or hold Shift and drag to select an area. Name your zone and save to Firebase.</div>
       </div>
       <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:8,marginBottom:14}}>
-        {[{l:"Zones Created",v:zones.length,c:"#12B6CF"},{l:"Areas",v:TOWNS.length,c:"#FFB347"},{l:"Skipped",v:skippedAreas.length,c:"#E53935"}].map(s=>(<div key={s.l} style={{background:"#0d1b2a",border:"1px solid #1a3a50",borderRadius:8,padding:"10px 8px",textAlign:"center"}}><div style={{fontSize:"1.2rem",fontWeight:700,color:s.c,fontFamily:"monospace"}}>{s.v}</div><div style={{fontSize:"0.52rem",color:"#64b5d8",textTransform:"uppercase"}}>{s.l}</div></div>))}
+        {[{l:"Zones Created",v:zones.length,c:"#12B6CF"},{l:"Areas",v:visibleTowns().length,c:"#FFB347"},{l:"Skipped",v:skippedAreas.length,c:"#E53935"}].map(s=>(<div key={s.l} style={{background:"#0d1b2a",border:"1px solid #1a3a50",borderRadius:8,padding:"10px 8px",textAlign:"center"}}><div style={{fontSize:"1.2rem",fontWeight:700,color:s.c,fontFamily:"monospace"}}>{s.v}</div><div style={{fontSize:"0.52rem",color:"#64b5d8",textTransform:"uppercase"}}>{s.l}</div></div>))}
       </div>
       <div style={{fontSize:"0.57rem",color:"#64b5d8",letterSpacing:"0.12em",textTransform:"uppercase",marginBottom:8}}>Select an Area to Zone</div>
       <button onClick={()=>openTownMap({id:"constituency",name:"Whole Constituency",ward:"All areas",color:"#9C27B0",lat:57.125,lng:-2.10,estProperties:25000,notes:"All areas across Aberdeen South"})} style={{width:"100%",background:"#0d1228",border:"2px solid #9C27B0",borderRadius:8,padding:"13px 14px",marginBottom:14,cursor:"pointer",textAlign:"left",display:"block"}}>
         <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start"}}>
-          <div><div style={{fontSize:"0.9rem",fontWeight:700,color:"#CE93D8"}}>🗺 Whole Constituency</div><div style={{fontSize:"0.58rem",color:"#9C27B0",marginTop:2}}>All {TOWNS.length} areas · postcode dots only</div></div>
+          <div><div style={{fontSize:"0.9rem",fontWeight:700,color:"#CE93D8"}}>🗺 Whole Constituency</div><div style={{fontSize:"0.58rem",color:"#9C27B0",marginTop:2}}>All {visibleTowns().length} areas · postcode dots only</div></div>
           <div style={{fontSize:"0.6rem",color:"#9C27B0",fontWeight:700}}>{zones.length} zones total</div>
         </div>
         <div style={{marginTop:6,fontSize:"0.58rem",color:"#4a7a8a"}}>Overview of the whole seat — gaps and skipped areas</div>
       </button>
-      {TOWNS.map(town => {
+      {/* Show-hidden toggle (only shown when there are hidden areas) */}
+      {TOWNS.some(t => isAreaHidden(t)) && (
+        <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",padding:"6px 4px 10px",marginBottom:4}}>
+          <div style={{fontSize:"0.55rem",color:"#4a7a8a"}}>{TOWNS.filter(t=>isAreaHidden(t)).length} hidden area(s)</div>
+          <button onClick={()=>setShowHidden(s=>!s)} style={{background:"none",border:"1px solid #4a7a8a",borderRadius:4,color:"#90E0EF",fontSize:"0.55rem",padding:"3px 8px",cursor:"pointer"}}>{showHidden?"Hide hidden":"Show hidden"}</button>
+        </div>
+      )}
+      {visibleTowns().map(town => {
         const townZones = zones.filter(z => z.townId === town.id);
         const totalStreets = townZones.reduce((a,z) => a+(z.streets||[]).length, 0);
+        const isHidden = isAreaHidden(town);
         return (
-          <button key={town.id} onClick={()=>openTownMap(town)} style={{width:"100%",background:"#0d1b2a",border:"1px solid #1a3a50",borderLeft:`4px solid ${town.color}`,borderRadius:8,padding:"13px 14px",marginBottom:10,cursor:"pointer",textAlign:"left",display:"block"}}>
+          <button key={town.id} onClick={()=>openTownMap(town)} style={{width:"100%",background:"#0d1b2a",border:"1px solid #1a3a50",borderLeft:`4px solid ${town.color}`,borderRadius:8,padding:"13px 14px",marginBottom:10,cursor:"pointer",textAlign:"left",display:"block",opacity:isHidden?0.45:1}}>
             <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start"}}>
-              <div><div style={{fontSize:"0.9rem",fontWeight:700,color:"#fff"}}>{town.name}</div><div style={{fontSize:"0.58rem",color:"#64b5d8",marginTop:2}}>~{town.estProperties.toLocaleString()} properties</div></div>
+              <div><div style={{fontSize:"0.9rem",fontWeight:700,color:"#fff"}}>{town.name}{isHidden?<span style={{fontSize:"0.55rem",color:"#FF8C00",marginLeft:6,fontWeight:600}}>HIDDEN</span>:""}</div><div style={{fontSize:"0.58rem",color:"#64b5d8",marginTop:2}}>~{town.estProperties.toLocaleString()} properties</div></div>
               <div style={{textAlign:"right",flexShrink:0,marginLeft:10}}>{townZones.length > 0 ? <div style={{fontSize:"0.62rem",color:"#4CAF50",fontWeight:700}}>✓ {townZones.length} zones · {totalStreets} streets</div> : <div style={{fontSize:"0.6rem",color:"#4a7a8a"}}>Not zoned yet</div>}</div>
             </div>
             <div style={{marginTop:6,fontSize:"0.58rem",color:"#4a7a8a"}}>{town.notes}</div>
-            <div style={{marginTop:6,fontSize:"0.55rem",color:"#4a7a8a",textAlign:"right"}}>Tap to open map →</div>
+            {isHidden ? (
+              <div style={{marginTop:6,display:"flex",justifyContent:"flex-end"}}>
+                <span onClick={e=>{e.stopPropagation();restoreArea(town.id);}} style={{fontSize:"0.6rem",color:"#FFB347",fontWeight:700,cursor:"pointer",padding:"2px 8px",border:"1px solid #FFB347",borderRadius:4}}>↺ Restore</span>
+              </div>
+            ) : (
+              <div style={{marginTop:6,fontSize:"0.55rem",color:"#4a7a8a",textAlign:"right"}}>Tap to open map →</div>
+            )}
           </button>
         );
       })}
