@@ -1,6 +1,6 @@
 import { useState, useRef, useEffect } from "react";
 import { initializeApp } from "firebase/app";
-import { getFirestore, doc, getDoc, onSnapshot, collection, addDoc, deleteDoc, updateDoc, query, orderBy } from "firebase/firestore";
+import { getFirestore, doc, getDoc, setDoc, onSnapshot, collection, addDoc, deleteDoc, updateDoc, query, orderBy, serverTimestamp } from "firebase/firestore";
 
 // ─── FIREBASE CONFIG (Aberdeen South project) ───────────────
 const firebaseConfig = {
@@ -1160,6 +1160,60 @@ function ZoneBuilderTab({user}) {
   const markersRef = useRef({});
   const streetLayersRef = useRef({});
 
+  // ── Polygon override system ─────────────────────────────────────
+  // Each area has a hard-coded polygon in TOWNS. Users with edit
+  // permission can override an area's polygon via the in-app polygon
+  // editor; overrides are stored in Firestore collection "polygonOverrides"
+  // (one doc per townId, doc data { polygon: [[lng,lat],...], editedBy, editedAt }).
+  // The effective polygon for a town is: override if present, else hard-coded.
+  const [polygonOverrides, setPolygonOverrides] = useState({});
+  useEffect(() => {
+    const unsub = onSnapshot(collection(db, "polygonOverrides"), snap => {
+      const map = {};
+      snap.forEach(d => { map[d.id] = d.data(); });
+      setPolygonOverrides(map);
+    });
+    return () => unsub();
+  }, []);
+  // Returns the effective polygon for a town: override if present, else hard-coded.
+  function getEffectivePolygon(town) {
+    if (!town) return null;
+    const ov = polygonOverrides[town.id];
+    if (ov && Array.isArray(ov.polygon) && ov.polygon.length >= 3) return ov.polygon;
+    return town.polygon || null;
+  }
+
+  // ── Polygon editor state ────────────────────────────────────────
+  const [editMode, setEditMode] = useState(false);
+  const editLayerRef = useRef(null);      // the Leaflet polygon being edited
+  const editedPolygonRef = useRef(null);  // latest edited shape (array of [lng,lat])
+  const [editStatus, setEditStatus] = useState("");
+  const [exportOpen, setExportOpen] = useState(false);
+  // Desktop-only: hide the editor entirely on screens narrower than 900px.
+  // Polygon editing is a deliberate desk-based task; phones and tablets get
+  // the read-only view of polygons.
+  const [isDesktop, setIsDesktop] = useState(typeof window !== "undefined" && window.innerWidth >= 900);
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const onResize = () => setIsDesktop(window.innerWidth >= 900);
+    window.addEventListener("resize", onResize);
+    return () => window.removeEventListener("resize", onResize);
+  }, []);
+  // Edit access — passcode-protected. Same 0409 as the existing admin tab.
+  // Once unlocked it stays unlocked for the session, so the manager isn't
+  // re-typing the passcode every time they switch areas.
+  const [editUnlocked, setEditUnlocked] = useState(false);
+  function unlockEditor() {
+    if (editUnlocked) { setEditMode(m => !m); return; }
+    const entered = window.prompt("Enter editor passcode:");
+    if (entered === "0409") {
+      setEditUnlocked(true);
+      setEditMode(true);
+    } else if (entered !== null) {
+      window.alert("Incorrect passcode.");
+    }
+  }
+
   async function loadStreets(town) {
     setStreets([]); setLoading(true);
     try {
@@ -1204,6 +1258,8 @@ function ZoneBuilderTab({user}) {
           }
           return inside;
         };
+        // Use effective polygon — Firebase override if present, else hard-coded.
+        const areaPoly = getEffectivePolygon(town);
         const inSeat = [];
         let droppedOutsideSeat = 0, droppedOutsideArea = 0;
         allStreets.forEach(street => {
@@ -1213,13 +1269,13 @@ function ZoneBuilderTab({user}) {
               // pt is [lat, lng]
               total++;
               if (isInsideConstituency(pt[1], pt[0])) insideSeat++;
-              if (town.polygon && pointInRing(pt[1], pt[0], town.polygon)) insideArea++;
+              if (areaPoly && pointInRing(pt[1], pt[0], areaPoly)) insideArea++;
             });
           });
           if (total === 0) { droppedOutsideSeat++; return; }
           const inSeatMajority = insideSeat * 2 > total;
           if (!inSeatMajority) { droppedOutsideSeat++; return; }
-          if (town.polygon) {
+          if (areaPoly) {
             const inAreaMajority = insideArea * 2 > total;
             if (!inAreaMajority) { droppedOutsideArea++; return; }
           }
@@ -1259,9 +1315,10 @@ function ZoneBuilderTab({user}) {
                 // If this town has its own polygon, drop dots outside that polygon too,
                 // so the single-area view stays clean. (Whole-constituency mode loops
                 // every TOWNS entry, so each dot still gets included via its own area.)
-                if (t.polygon) {
+                const tPoly = getEffectivePolygon(t);
+                if (tPoly) {
                   let inArea = false;
-                  const ring = t.polygon;
+                  const ring = tPoly;
                   for (let i = 0, j = ring.length - 1; i < ring.length; j = i++) {
                     const xi = ring[i][0], yi = ring[i][1];
                     const xj = ring[j][0], yj = ring[j][1];
@@ -1368,20 +1425,49 @@ function ZoneBuilderTab({user}) {
           if (seg.length < 2) return;
           const line = L.polyline(seg, { color: initColor, weight: initWeight, opacity: initOpacity }).addTo(map);
           line.bindTooltip(`${street.name}${isSaved ? " ✓ Zoned" : isSkipped ? " ❌ Skipped" : ""}`, { sticky: true, direction: "top", className: "" });
-          line.on("click", () => { toggleStreet(street.id); });
+          line.on("click", () => { if (!editMode) toggleStreet(street.id); });
           layers.push(line); seg.forEach(pt => bounds.push(pt));
         });
         streetLayersRef.current[street.id] = layers;
       });
-      // Draw the area's own boundary shape on the map so the manager can see
-      // exactly which area they are working in. For areas with a polygon (Stage 4),
-      // draw the polygon as a solid coloured line. For areas still using the
-      // legacy search-box only, draw the dashed rectangle as a fallback hint.
+      // Draw the area boundary on the map. When edit mode is ON for the selected
+      // area, draw it as an EDITABLE Leaflet-Geoman polygon so the manager can
+      // drag vertices. Otherwise draw it as a non-interactive coloured polyline.
       if (selTown && selTown.id !== "constituency") {
-        if (selTown.polygon) {
-          // polygon coords are [lng,lat] — Leaflet wants [lat,lng]
-          const ring = selTown.polygon.map(p => [p[1], p[0]]);
-          L.polyline(ring, { color: selTown.color || "#FFB347", weight: 2, opacity: 0.7, dashArray: "6,4", interactive: false }).addTo(map);
+        const effPoly = getEffectivePolygon(selTown);
+        if (effPoly) {
+          const ring = effPoly.map(p => [p[1], p[0]]); // [lng,lat] -> [lat,lng]
+          if (editMode) {
+            // Editable polygon — uses Leaflet-Geoman if available.
+            const poly = L.polygon(ring, { color: selTown.color || "#FFB347", weight: 3, opacity: 0.9, fillOpacity: 0.05 }).addTo(map);
+            if (typeof poly.pm !== "undefined" && poly.pm.enable) {
+              try {
+                poly.pm.enable({
+                  allowSelfIntersection: false,
+                  preventMarkerRemoval: false,
+                  snappable: true,
+                  draggable: false,
+                });
+              } catch(e) { console.warn("Geoman enable failed:", e); }
+            }
+            editLayerRef.current = poly;
+            // Live-update the stored shape as the user drags vertices.
+            const captureShape = () => {
+              const latlngs = poly.getLatLngs()[0]; // [{lat,lng},...]
+              const ringOut = latlngs.map(ll => [ll.lng, ll.lat]);
+              // Close the ring if not closed
+              if (ringOut.length > 0) {
+                const first = ringOut[0], last = ringOut[ringOut.length-1];
+                if (first[0] !== last[0] || first[1] !== last[1]) ringOut.push([first[0], first[1]]);
+              }
+              editedPolygonRef.current = ringOut;
+            };
+            poly.on("pm:markerdragend pm:vertexadded pm:vertexremoved pm:edit pm:update", captureShape);
+            captureShape();  // initial capture
+          } else {
+            // Static polygon — read-only view.
+            L.polyline(ring, { color: selTown.color || "#FFB347", weight: 2, opacity: 0.7, dashArray: "6,4", interactive: false }).addTo(map);
+          }
         } else if (selTown.searchPadNS != null) {
           const padNS = selTown.searchPadNS, padEW = selTown.searchPadEW ?? 0.020;
           const sw = [selTown.lat - padNS, selTown.lng - padEW];
@@ -1410,7 +1496,7 @@ function ZoneBuilderTab({user}) {
       }
       // Shift+drag select circle
       let dragging = false, startLatLng = null, dragCircle = null;
-      map.on("mousedown", e => { if (e.originalEvent.shiftKey) { dragging = true; startLatLng = e.latlng; map.dragging.disable(); e.originalEvent.preventDefault(); } });
+      map.on("mousedown", e => { if (editMode) return; if (e.originalEvent.shiftKey) { dragging = true; startLatLng = e.latlng; map.dragging.disable(); e.originalEvent.preventDefault(); } });
       map.on("mousemove", e => { if (!dragging || !startLatLng) return; const radiusM = startLatLng.distanceTo(e.latlng); if (dragCircle) map.removeLayer(dragCircle); dragCircle = L.circle(startLatLng, { radius: radiusM, color: "#FF6B35", weight: 2, fillOpacity: 0.1, dashArray: "6,4" }).addTo(map); });
       map.on("mouseup", e => {
         if (!dragging || !startLatLng) return; dragging = false; map.dragging.enable();
@@ -1428,7 +1514,77 @@ function ZoneBuilderTab({user}) {
       });
     }, 300);
     return () => { clearTimeout(timer); if (mapInstanceRef.current) { mapInstanceRef.current.remove(); mapInstanceRef.current = null; } markersRef.current = {}; streetLayersRef.current = {}; };
-  }, [view, allDots, streets]);
+  }, [view, allDots, streets, editMode, polygonOverrides, selTown?.id]);
+
+  // ── Polygon editor: save and export ────────────────────────────
+  // Save the edited polygon for the current area to Firestore. The override
+  // applies immediately for everyone — the onSnapshot subscription will pick
+  // up the change and the next time the area is opened the new polygon is used.
+  async function savePolygonOverride() {
+    if (!selTown || !editedPolygonRef.current) return;
+    const ring = editedPolygonRef.current;
+    if (!Array.isArray(ring) || ring.length < 4) {
+      setEditStatus("Need at least 3 vertices.");
+      setTimeout(() => setEditStatus(""), 4000);
+      return;
+    }
+    const vertexCount = ring.length - 1; // last vertex is the closer
+    const ok = window.confirm(`Save ${selTown.name} polygon (${vertexCount} vertices)?\n\nThis goes live immediately for everyone.`);
+    if (!ok) return;
+    try {
+      await setDoc(doc(db, "polygonOverrides", selTown.id), {
+        polygon: ring,
+        townId: selTown.id,
+        townName: selTown.name,
+        editedBy: user?.name || "Unknown",
+        editedAt: serverTimestamp(),
+      });
+      setEditStatus(`Saved ${selTown.name} (${vertexCount} vertices).`);
+      setTimeout(() => setEditStatus(""), 4000);
+    } catch(e) {
+      console.error("Save polygon override failed:", e);
+      setEditStatus(`Save failed: ${e.message}`);
+      setTimeout(() => setEditStatus(""), 6000);
+    }
+  }
+  // Revert the override for this area back to the hard-coded polygon.
+  async function revertPolygonOverride() {
+    if (!selTown) return;
+    if (!polygonOverrides[selTown.id]) {
+      setEditStatus("No override to revert.");
+      setTimeout(() => setEditStatus(""), 3000);
+      return;
+    }
+    const ok = window.confirm(`Revert ${selTown.name} polygon to the original built-in shape?\n\nYour edits will be lost.`);
+    if (!ok) return;
+    try {
+      await deleteDoc(doc(db, "polygonOverrides", selTown.id));
+      setEditStatus(`Reverted ${selTown.name}.`);
+      setTimeout(() => setEditStatus(""), 4000);
+    } catch(e) {
+      console.error("Revert polygon override failed:", e);
+      setEditStatus(`Revert failed: ${e.message}`);
+      setTimeout(() => setEditStatus(""), 6000);
+    }
+  }
+  // Build a code-ready export of every effective polygon (hard-coded + overrides),
+  // so the manager can paste the result into the next App.jsx release.
+  function buildPolygonExport() {
+    const lines = [];
+    lines.push("// Polygon export — generated " + new Date().toISOString());
+    lines.push("// Paste the relevant polygon: lines into the matching TOWNS entries.");
+    lines.push("");
+    TOWNS.forEach(t => {
+      if (t.id === "constituency") return;
+      const eff = getEffectivePolygon(t);
+      if (!eff) return;
+      const overridden = !!polygonOverrides[t.id];
+      lines.push(`// ${t.name} (${t.id})${overridden ? " — EDITED" : ""}`);
+      lines.push(`polygon: ${JSON.stringify(eff)},`);
+      lines.push("");
+    });
+    return lines.join("\n");
+  }
 
   async function saveZone() {
     const hasStreets = selectedStreets.size > 0; const hasDots = selected.size > 0;
@@ -1511,14 +1667,29 @@ function ZoneBuilderTab({user}) {
     return (
       <div style={{display:"flex",flexDirection:"column",height:"calc(100vh - 106px)"}}>
         <div style={{background:"#03045E",padding:"10px 16px",flexShrink:0}}>
-          <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:6}}>
-            <button onClick={()=>{setView("towns");if(mapInstanceRef.current){mapInstanceRef.current.remove();mapInstanceRef.current=null;}}} style={{background:"none",border:"none",color:"#12B6CF",fontSize:"0.75rem",cursor:"pointer",padding:0}}>← Areas</button>
-            <button onClick={()=>setView("zones")} style={{background:"#1a3a50",border:"1px solid #12B6CF",borderRadius:6,color:"#12B6CF",fontSize:"0.62rem",padding:"4px 10px",cursor:"pointer"}}>{townZones.length} zones</button>
+          <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:6,gap:8}}>
+            <button onClick={()=>{setEditMode(false);setView("towns");if(mapInstanceRef.current){mapInstanceRef.current.remove();mapInstanceRef.current=null;}}} style={{background:"none",border:"none",color:"#12B6CF",fontSize:"0.75rem",cursor:"pointer",padding:0}}>← Areas</button>
+            <div style={{display:"flex",gap:6,alignItems:"center"}}>
+              {isDesktop && selTown && selTown.id !== "constituency" && (
+                <button onClick={unlockEditor} title="Edit polygon (desktop only, passcode protected)" style={{background:editMode?"#FFB347":"#1a3a50",border:`1px solid ${editMode?"#FFB347":"#12B6CF55"}`,borderRadius:6,color:editMode?"#03045E":"#12B6CF",fontSize:"0.62rem",fontWeight:700,padding:"4px 10px",cursor:"pointer",whiteSpace:"nowrap"}}>{editMode?"✏️ Editing":"✏️ Edit Polygon"}</button>
+              )}
+              <button onClick={()=>setView("zones")} style={{background:"#1a3a50",border:"1px solid #12B6CF",borderRadius:6,color:"#12B6CF",fontSize:"0.62rem",padding:"4px 10px",cursor:"pointer"}}>{townZones.length} zones</button>
+            </div>
           </div>
-          <div style={{fontSize:"0.82rem",fontWeight:700,color:"#fff"}}>{selTown.name} — {mode === "skip" ? "❌ Skip mode" : "🗺 Zone mode"}</div>
+          <div style={{fontSize:"0.82rem",fontWeight:700,color:"#fff"}}>{selTown.name} — {editMode ? "✏️ Edit polygon" : mode === "skip" ? "❌ Skip mode" : "🗺 Zone mode"}</div>
           <div style={{fontSize:"0.58rem",color:"#90E0EF",marginTop:2}}>{loading ? "Loading…" : `${streets.length} streets · ${allDots.length} postcode pts · ${totalSelected} selected`}</div>
-          <div style={{fontSize:"0.55rem",color:"#4a7a8a",marginTop:2}}>Tap streets or dots to select · Hold Shift + drag to select area</div>
+          <div style={{fontSize:"0.55rem",color:"#4a7a8a",marginTop:2}}>{editMode ? "Drag vertices to reshape. Click a midpoint dot to add a vertex. Right-click a vertex to remove it." : "Tap streets or dots to select · Hold Shift + drag to select area"}</div>
         </div>
+        {editMode && (
+          <div style={{background:"#1a1330",padding:"8px 16px",borderBottom:"1px solid #FFB347",display:"flex",alignItems:"center",gap:8,flexWrap:"wrap"}}>
+            <button onClick={savePolygonOverride} style={{background:"#4CAF50",border:"none",borderRadius:6,color:"#fff",fontSize:"0.65rem",fontWeight:700,padding:"6px 12px",cursor:"pointer"}}>💾 Save polygon</button>
+            <button onClick={revertPolygonOverride} disabled={!polygonOverrides[selTown?.id]} style={{background:polygonOverrides[selTown?.id]?"#FF8C00":"#1a3a50",border:"none",borderRadius:6,color:polygonOverrides[selTown?.id]?"#fff":"#4a7a8a",fontSize:"0.65rem",fontWeight:700,padding:"6px 12px",cursor:polygonOverrides[selTown?.id]?"pointer":"default"}}>↺ Revert to built-in</button>
+            <button onClick={()=>setExportOpen(true)} style={{background:"#1a3a50",border:"1px solid #12B6CF",borderRadius:6,color:"#12B6CF",fontSize:"0.65rem",fontWeight:700,padding:"6px 12px",cursor:"pointer"}}>📋 Export all</button>
+            <button onClick={()=>setEditMode(false)} style={{background:"none",border:"1px solid #4a7a8a",borderRadius:6,color:"#90E0EF",fontSize:"0.65rem",padding:"6px 12px",cursor:"pointer",marginLeft:"auto"}}>Done</button>
+            {editStatus && <div style={{flexBasis:"100%",fontSize:"0.6rem",color:editStatus.startsWith("Save failed")||editStatus.startsWith("Revert failed")?"#FF6B35":"#4CAF50",marginTop:4}}>{editStatus}</div>}
+            {polygonOverrides[selTown?.id] && <div style={{flexBasis:"100%",fontSize:"0.55rem",color:"#FFB347"}}>This area has an active override (edited by {polygonOverrides[selTown?.id].editedBy||"unknown"}).</div>}
+          </div>
+        )}
         {loading ? <div style={{flex:1,display:"flex",alignItems:"center",justifyContent:"center",background:"#060d18"}}><div style={{color:"#12B6CF",fontSize:"0.8rem"}}>Loading map data…</div></div> : <div ref={mapRef} style={{flex:1,width:"100%"}}/>}
         <div style={{background:"#0d1b2a",padding:"10px 16px",flexShrink:0,borderTop:"1px solid #1a3a50"}}>
           {savedMsg && <div style={{background:savedMsg.startsWith("❌")?"#2a0a0a":"#0a2a15",border:`1px solid ${savedMsg.startsWith("❌")?"#E53935":"#4CAF50"}`,borderRadius:6,padding:"6px 10px",marginBottom:8,fontSize:"0.65rem",color:savedMsg.startsWith("❌")?"#E53935":"#4CAF50"}}>{savedMsg}</div>}
@@ -1547,6 +1718,22 @@ function ZoneBuilderTab({user}) {
           )}
           {totalSelected === 0 && (<div style={{fontSize:"0.62rem",color:"#4a7a8a",textAlign:"center"}}>{mode === "zone" ? "Tap streets (lines) or postcode dots to select · Shift+drag to select area" : "Tap streets or dots to mark as skip"}</div>)}
         </div>
+        {exportOpen && (
+          <div onClick={()=>setExportOpen(false)} style={{position:"fixed",inset:0,background:"#000c",zIndex:9999,display:"flex",alignItems:"center",justifyContent:"center",padding:20}}>
+            <div onClick={e=>e.stopPropagation()} style={{background:"#0a1228",border:"1px solid #12B6CF",borderRadius:10,padding:20,maxWidth:720,width:"100%",maxHeight:"80vh",display:"flex",flexDirection:"column",gap:10}}>
+              <div style={{display:"flex",alignItems:"center",justifyContent:"space-between"}}>
+                <div style={{fontSize:"0.78rem",fontWeight:700,color:"#12B6CF"}}>📋 Polygon Export</div>
+                <button onClick={()=>setExportOpen(false)} style={{background:"none",border:"none",color:"#90E0EF",fontSize:"1.1rem",cursor:"pointer",padding:"0 4px"}}>×</button>
+              </div>
+              <div style={{fontSize:"0.62rem",color:"#90E0EF",lineHeight:1.5}}>Copy this and send it to Claude in your next chat. Claude will bake the edits into the next App.jsx release so the changes are permanent in the code, not just in Firebase.</div>
+              <textarea readOnly value={buildPolygonExport()} style={{flex:1,minHeight:220,background:"#060d18",border:"1px solid #1a3a50",borderRadius:6,color:"#c0d8e4",fontFamily:"monospace",fontSize:"0.6rem",padding:10,outline:"none",resize:"vertical"}}/>
+              <div style={{display:"flex",gap:8,justifyContent:"flex-end"}}>
+                <button onClick={()=>{ try { navigator.clipboard.writeText(buildPolygonExport()); setEditStatus("Export copied to clipboard."); setTimeout(()=>setEditStatus(""),3000); } catch(e) { setEditStatus("Copy failed — select text manually."); setTimeout(()=>setEditStatus(""),4000); } }} style={{background:"#12B6CF",border:"none",borderRadius:6,color:"#03045E",fontSize:"0.65rem",fontWeight:700,padding:"7px 14px",cursor:"pointer"}}>Copy to clipboard</button>
+                <button onClick={()=>setExportOpen(false)} style={{background:"#1a3a50",border:"1px solid #4a7a8a",borderRadius:6,color:"#90E0EF",fontSize:"0.65rem",padding:"7px 14px",cursor:"pointer"}}>Close</button>
+              </div>
+            </div>
+          </div>
+        )}
       </div>
     );
   }
