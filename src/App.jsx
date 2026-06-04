@@ -1231,13 +1231,30 @@ function ZoneBuilderTab({user}) {
   async function loadStreets(town) {
     setStreets([]); setLoading(true);
     try {
-      // Per-area search radius. Aberdeen South neighbourhoods are tightly packed,
-      // so use a tight default and let each area override. searchPadNS = north-south
-      // (latitude degrees ~ 111 km/deg), searchPadEW = east-west (at 57°N ~ 60 km/deg).
-      // Defaults give roughly +/- 1.3 km N/S and +/- 1.2 km E/W around the centre.
-      const padNS = town.searchPadNS ?? 0.012;
-      const padEW = town.searchPadEW ?? 0.020;
-      const south = (town.lat - padNS).toFixed(6), west = (town.lng - padEW).toFixed(6), north = (town.lat + padNS).toFixed(6), east = (town.lng + padEW).toFixed(6);
+      // Compute the Overpass search box. If the area has a polygon (which is
+      // the normal case after Stage 4), derive the search box from the
+      // polygon's own bounding box plus a small buffer — that way edits to
+      // the polygon automatically grow the search box. If there's no polygon,
+      // fall back to the legacy centre + pad arrangement.
+      const effPoly = getEffectivePolygon(town);
+      let south, west, north, east;
+      if (effPoly && effPoly.length >= 3) {
+        const lngs = effPoly.map(p => p[0]);
+        const lats = effPoly.map(p => p[1]);
+        const buffer = 0.003;  // ~330m N/S, ~180m E/W at 57°N — covers border streets
+        south = (Math.min(...lats) - buffer).toFixed(6);
+        north = (Math.max(...lats) + buffer).toFixed(6);
+        west  = (Math.min(...lngs) - buffer).toFixed(6);
+        east  = (Math.max(...lngs) + buffer).toFixed(6);
+      } else {
+        // Legacy fallback for any town that somehow has no polygon (defensive).
+        const padNS = town.searchPadNS ?? 0.012;
+        const padEW = town.searchPadEW ?? 0.020;
+        south = (town.lat - padNS).toFixed(6);
+        north = (town.lat + padNS).toFixed(6);
+        west  = (town.lng - padEW).toFixed(6);
+        east  = (town.lng + padEW).toFixed(6);
+      }
       const endpoints = ["https://overpass-api.de/api/interpreter","https://overpass.kumi.systems/api/interpreter","https://maps.mail.ru/osm/tools/overpass/api/interpreter"];
       const overpassQuery = `[out:json][timeout:30];way["highway"~"^(residential|primary|secondary|tertiary|unclassified|living_street|pedestrian|service)$"]["name"](${south},${west},${north},${east});out geom;`;
       let data = null;
